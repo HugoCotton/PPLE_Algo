@@ -208,7 +208,7 @@ def plot_ticker(
         print(f"[CHART] Saved → {save_path}")
         plt.close(fig)
     else:
-        plt.show()
+        plt.show(block=False)
 
 
 # ---------------------------------------------------------------------------

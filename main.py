@@ -245,6 +245,9 @@ def main() -> None:
         os.makedirs(args.save_charts, exist_ok=True)
         print(f"[INFO] Saving charts for top/bottom 10 to {args.save_charts}/")
         plot_top_n(ranked_df, stock_data, n=10, save_dir=args.save_charts)
+    
+    if args.plot or args.plot_top:
+        plt.show()
 
 
 if __name__ == "__main__":

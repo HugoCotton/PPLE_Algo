@@ -19,8 +19,8 @@ import alpaca_trade_api as tradeapi
 # ──────────────────────────────────────────────
 # 1. CONNECT TO ALPACA
 # ──────────────────────────────────────────────
-API_KEY    = "PKEQBGNWJAGFRL4F2HQVQKUH6O"
-SECRET_KEY = "J5cBgyHbmCJMB8UdbmfmvYiJMpEd9n8U5HfhKdm1ppVT"
+API_KEY    = os.environ.get("ALPACA_API_KEY")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BASE_URL   = "https://paper-api.alpaca.markets"
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
@@ -266,6 +266,45 @@ def run_risk_layer(ranked_candidates: list[str]) -> tuple[dict, bool]:
 
     return sized, False
 
+# ──────────────────────────────────────────────
+# 7. EXECUTION — submits orders to Alpaca
+# ──────────────────────────────────────────────
+def execute_trades(sized_positions: dict):
+    """
+    Takes sized positions from run_risk_layer and submits
+    bracket orders to Alpaca (buy + stop-loss in one go).
+    """
+    existing = [p.symbol for p in api.list_positions()]
+
+    for ticker, dollar_amount in sized_positions.items():
+
+        # Skip if we already own this stock
+        if ticker in existing:
+            print(f"[EXEC] {ticker} — already held, skipping")
+            continue
+
+        # Get current price and calculate how many shares to buy
+        latest      = api.get_latest_trade(ticker)
+        price       = float(latest.price)
+        qty         = int(dollar_amount // price)
+        stop_price  = round(price * 0.95, 2)  # 5% stop-loss
+
+        if qty < 1:
+            print(f"[EXEC] {ticker} — not enough funds for 1 share, skipping")
+            continue
+
+        # Submit bracket order (buy + stop-loss together)
+        api.submit_order(
+            symbol        = ticker,
+            qty           = qty,
+            side          = "buy",
+            type          = "market",
+            time_in_force = "day",
+            order_class   = "bracket",
+            stop_loss     = {"stop_price": stop_price}
+        )
+
+        print(f"[EXEC] ✅ Order submitted: {ticker}  qty={qty}  stop=${stop_price}")
 
 # ──────────────────────────────────────────────
 # Quick standalone test
@@ -283,3 +322,4 @@ if __name__ == "__main__":
         print("\nFinal sized positions:")
         for ticker, amount in sized_positions.items():
             print(f"  {ticker}: ${amount:,.2f}")
+

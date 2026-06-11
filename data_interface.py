@@ -1,120 +1,233 @@
 """
 data_interface.py
 =================
-Loads stock data from a local CSV file.
-
-Expected CSV format (matches top_100_clean_ohlcv.csv):
-  Date        — string, parseable as a date (e.g. "2026-01-16")
-  Ticker      — string ticker symbol (e.g. "AAPL")
-  Open        — float
-  High        — float
-  Low         — float
-  Close       — float
-  Adj Close   — float  (loaded but not used in analysis)
-  Volume      — int
-
-The file contains all tickers stacked in one flat table (long format).
-get_stock_data() splits it into a dict of per-ticker DataFrames, each
-with a DatetimeIndex sorted ascending, ready for the indicators pipeline.
-
-To point at a different file, change CSV_PATH below.
+Member A: Data — Alice Galzin
+PPLE Investment Club · Algo Team
+-------------------------------------------------
+Responsibilities:
+  1. Screen the S&P 500 universe daily by avg. daily volume
+  2. Fetch OHLCV prices via yFinance
+  3. Clean and validate data for signals module
+-------------------------------------------------
 """
 
 import pandas as pd
+import yfinance as yf
+import logging
+from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Configuration — change this path if your CSV lives elsewhere
-# ---------------------------------------------------------------------------
-
-CSV_PATH = "top_100_clean_ohlcv.csv"
-
-# Column name mapping: CSV column → internal name expected by indicators.py
-# If your CSV uses different column headers, edit the keys here.
-COLUMN_MAP = {
-    "Date":      "Date",        # will become the DatetimeIndex
-    "Ticker":    "Ticker",      # used to split into per-ticker DataFrames
-    "Open":      "Open",
-    "High":      "High",
-    "Low":       "Low",
-    "Close":     "Close",
-    "Adj Close": "Adj Close",   # retained but not used in scoring
-    "Volume":    "Volume",
-}
+logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Public interface
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────
+TOP_N_TICKERS   = 100    # how many most-liquid tickers to screen
+HISTORY_DAYS    = "6mo"  # how much history to download (needs ≥60 rows for indicators)
+MIN_ROWS        = 60     # minimum trading days required for indicator calc
+SP500_URL       = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
 
-def get_ticker_list() -> list[str]:
+
+# ──────────────────────────────────────────────
+# 1. FETCH S&P 500 TICKER LIST
+# ──────────────────────────────────────────────
+def get_sp500_tickers() -> list[str]:
     """
-    Return a sorted list of all unique ticker symbols found in the CSV.
+    Download the current S&P 500 constituent list from DataHub.
 
-    Reads only the "Ticker" column (no need to load the full file) and
-    returns deduplicated, uppercase-sorted symbols.
-
-    Returns:
-        A list of strings, e.g. ["AAPL", "AMZN", "GOOG", ...]
+    Returns
+    -------
+    list of ticker strings, with dots replaced by hyphens (Yahoo Finance format)
+    e.g. "BRK.B" → "BRK-B"
     """
-    tickers = pd.read_csv(CSV_PATH, usecols=["Ticker"])["Ticker"]
-    return sorted(tickers.unique().tolist())
+    try:
+        sp500 = pd.read_csv(SP500_URL)
+        tickers = sp500["Symbol"].tolist()
+        tickers = [t.replace(".", "-") for t in tickers]
+        logger.info(f"[DATA] Fetched {len(tickers)} S&P 500 tickers.")
+        return tickers
+    except Exception as e:
+        logger.error(f"[DATA] Failed to fetch S&P 500 list: {e}")
+        # Fallback: a hardcoded set of large-cap tickers
+        logger.warning("[DATA] Using fallback ticker list.")
+        return [
+            "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG",
+            "TSLA", "BRK-B", "JPM", "LLY", "V", "UNH", "XOM", "MA",
+            "AVGO", "JNJ", "HD", "PG", "COST", "MRK", "ABBV", "CVX",
+            "KO", "PEP", "WMT", "NFLX", "BAC", "CRM", "TMO",
+        ]
 
 
-def get_stock_data() -> dict[str, pd.DataFrame]:
+# ──────────────────────────────────────────────
+# 2. SCREEN BY LIQUIDITY (avg. daily volume)
+# ──────────────────────────────────────────────
+def screen_by_volume(tickers: list[str], top_n: int = TOP_N_TICKERS) -> list[str]:
     """
-    Load the full CSV and split it into a dict of per-ticker DataFrames.
+    Download 3 months of volume data for all tickers and rank by
+    average daily volume. Returns the top_n most liquid symbols.
 
-    Steps:
-      1. Read the entire CSV into a single DataFrame.
-      2. Rename columns according to COLUMN_MAP (no-op if names already match).
-      3. Parse the Date column as datetime and set it as the index.
-      4. Sort each ticker's rows by date ascending (oldest first).
-      5. Split by ticker into individual DataFrames.
-      6. Warn and skip any ticker with fewer than 60 rows (indicators need
-         at least 50 for SMA50 plus a warmup buffer).
+    Parameters
+    ----------
+    tickers : full S&P 500 ticker list
+    top_n   : number of tickers to keep
 
-    Returns:
-        dict mapping ticker string → pd.DataFrame with:
-          - DatetimeIndex (ascending)
-          - Columns: Open, High, Low, Close, Adj Close, Volume
+    Returns
+    -------
+    list of the top_n ticker strings by liquidity
     """
-    # --- Load ---
-    raw = pd.read_csv(CSV_PATH)
+    logger.info(f"[DATA] Screening {len(tickers)} tickers by volume...")
 
-    # --- Validate expected columns are present ---
-    missing = [col for col in COLUMN_MAP.keys() if col not in raw.columns]
-    if missing:
-        raise ValueError(
-            f"CSV is missing expected columns: {missing}\n"
-            f"Found columns: {list(raw.columns)}"
+    try:
+        raw = yf.download(
+            tickers,
+            period="3mo",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
         )
+    except Exception as e:
+        logger.error(f"[DATA] Volume screen download failed: {e}")
+        return tickers[:top_n]
 
-    # --- Rename to internal names (harmless if names already match) ---
-    raw = raw.rename(columns=COLUMN_MAP)
+    # Handle yfinance column ordering quirk
+    if raw.columns.nlevels == 2 and raw.columns[0][0] in ["Open","High","Low","Close","Adj Close","Volume"]:
+        raw = raw.swaplevel(axis=1)
+    raw = raw.sort_index(axis=1)
 
-    # --- Parse dates and set as index ---
-    raw["Date"] = pd.to_datetime(raw["Date"])
-    raw = raw.sort_values(["Ticker", "Date"])
-
-    # --- Split into per-ticker DataFrames ---
-    result: dict[str, pd.DataFrame] = {}
-
-    for ticker, group in raw.groupby("Ticker"):
-        df = (
-            group
-            .drop(columns=["Ticker"])   # ticker identity now lives in the dict key
-            .set_index("Date")
-            .sort_index()               # ensure ascending date order
-        )
-
-        if len(df) < 60:
-            print(
-                f"[WARN] {ticker}: only {len(df)} rows — "
-                f"need at least 60 for reliable indicator calculation. Skipping."
-            )
+    volume_dict = {}
+    for ticker in tickers:
+        try:
+            avg_vol = raw[ticker]["Volume"].dropna().mean()
+            if pd.notna(avg_vol) and avg_vol > 0:
+                volume_dict[ticker] = avg_vol
+        except Exception:
             continue
 
-        result[ticker] = df
+    sorted_tickers = sorted(volume_dict.items(), key=lambda x: x[1], reverse=True)
+    top_tickers = [t[0] for t in sorted_tickers[:top_n]]
 
-    print(f"[INFO] Loaded {len(result)} tickers from '{CSV_PATH}'.")
-    return result
+    logger.info(f"[DATA] Top {len(top_tickers)} tickers by avg volume selected.")
+    return top_tickers
+
+
+# ──────────────────────────────────────────────
+# 3. FETCH OHLCV HISTORY FOR SCREENED TICKERS
+# ──────────────────────────────────────────────
+def fetch_ohlcv(tickers: list[str], period: str = HISTORY_DAYS) -> dict[str, pd.DataFrame]:
+    """
+    Download full OHLCV data for a list of tickers.
+
+    Parameters
+    ----------
+    tickers : list of ticker strings
+    period  : yfinance period string e.g. "6mo", "1y"
+
+    Returns
+    -------
+    dict mapping ticker → clean DataFrame with columns:
+        Date, Open, High, Low, Close, Adj Close, Volume
+    """
+    logger.info(f"[DATA] Downloading {period} OHLCV for {len(tickers)} tickers...")
+
+    try:
+        raw = yf.download(
+            tickers,
+            period=period,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+        )
+    except Exception as e:
+        logger.error(f"[DATA] OHLCV download failed: {e}")
+        return {}
+
+    # Fix column ordering quirk
+    if raw.columns.nlevels == 2 and raw.columns[0][0] in ["Open","High","Low","Close","Adj Close","Volume"]:
+        raw = raw.swaplevel(axis=1)
+    raw = raw.sort_index(axis=1)
+
+    stock_data = {}
+    for ticker in tickers:
+        try:
+            df = raw[ticker].copy().dropna(how="all")
+            if len(df) < MIN_ROWS:
+                logger.warning(f"[DATA] {ticker}: only {len(df)} rows — skipping (need {MIN_ROWS})")
+                continue
+            stock_data[ticker] = df
+        except Exception as e:
+            logger.warning(f"[DATA] {ticker}: failed to extract — {e}")
+            continue
+
+    logger.info(f"[DATA] Clean data ready for {len(stock_data)} tickers.")
+    return stock_data
+
+
+# ──────────────────────────────────────────────
+# 4. CLEAN & VALIDATE
+# ──────────────────────────────────────────────
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply standard cleaning to a single ticker's DataFrame:
+      - Ensure DatetimeIndex
+      - Forward-fill small gaps (max 2 days, weekend gaps etc.)
+      - Drop rows where Close is NaN after fill
+      - Sort by date ascending
+
+    Parameters
+    ----------
+    df : raw OHLCV DataFrame
+
+    Returns
+    -------
+    cleaned DataFrame
+    """
+    df = df.copy()
+
+    # Ensure DatetimeIndex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+
+    df = df.sort_index()
+    df["Close"] = df["Close"].ffill(limit=2)
+    df = df.dropna(subset=["Close"])
+    return df
+
+
+# ──────────────────────────────────────────────
+# 5. MAIN ENTRY POINT  (called by main.py)
+# ──────────────────────────────────────────────
+def get_stock_data() -> dict[str, pd.DataFrame]:
+    """
+    Full pipeline: screen → fetch → clean.
+
+    Called by main.py as:
+        stock_data = get_stock_data()
+
+    Returns
+    -------
+    dict {ticker: cleaned_DataFrame}  ready for scorer.build_rankings()
+    """
+    tickers     = get_sp500_tickers()
+    top_tickers = screen_by_volume(tickers, top_n=TOP_N_TICKERS)
+    raw_data    = fetch_ohlcv(top_tickers)
+
+    clean_data = {}
+    for ticker, df in raw_data.items():
+        try:
+            clean_data[ticker] = clean_dataframe(df)
+        except Exception as e:
+            logger.warning(f"[DATA] Cleaning failed for {ticker}: {e}")
+
+    logger.info(f"[DATA] Pipeline complete — {len(clean_data)} tickers ready.")
+    return clean_data
+
+
+# ──────────────────────────────────────────────
+# Standalone test
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    data = get_stock_data()
+    print(f"\nReady tickers: {len(data)}")
+    for t, df in list(data.items())[:3]:
+        print(f"  {t}: {len(df)} rows, last close={df['Close'].iloc[-1]:.2f}")

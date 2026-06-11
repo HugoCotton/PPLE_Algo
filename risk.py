@@ -19,8 +19,8 @@ import alpaca_trade_api as tradeapi
 # ──────────────────────────────────────────────
 # 1. CONNECT TO ALPACA
 # ──────────────────────────────────────────────
-API_KEY    = os.environ.get("ALPACA_API_KEY")
-SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+API_KEY    = "PKEQBGNWJAGFRL4F2HQVQKUH6O"
+SECRET_KEY = "J5cBgyHbmCJMB8UdbmfmvYiJMpEd9n8U5HfhKdm1ppVT"
 BASE_URL   = "https://paper-api.alpaca.markets"
 
 api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
@@ -63,7 +63,7 @@ def size_positions(ranked_candidates: list[str]) -> dict:
 # ──────────────────────────────────────────────
 # 3. STOP-LOSS CALCULATOR
 # ──────────────────────────────────────────────
-def calculate_stop_loss(ticker: str, stop_pct: float = 0.05) -> float:
+def calculate_stop_loss(ticker: str, stop_pct: float = 0.15) -> float:
     """
     Fetches the latest price for a ticker and returns
     the stop-loss price (default: 5% below entry).
@@ -293,7 +293,9 @@ def execute_trades(sized_positions: dict):
             print(f"[EXEC] {ticker} — not enough funds for 1 share, skipping")
             continue
 
-        # Submit bracket order (buy + stop-loss together)
+        take_profit_price = round(price * 1.40, 2)  # 10% take-profit
+
+        # Submit bracket order (buy + stop-loss + take-profit)
         api.submit_order(
             symbol        = ticker,
             qty           = qty,
@@ -301,7 +303,8 @@ def execute_trades(sized_positions: dict):
             type          = "market",
             time_in_force = "day",
             order_class   = "bracket",
-            stop_loss     = {"stop_price": stop_price}
+            stop_loss     = {"stop_price": stop_price},
+            take_profit   = {"limit_price": take_profit_price},
         )
 
         print(f"[EXEC] ✅ Order submitted: {ticker}  qty={qty}  stop=${stop_price}")
